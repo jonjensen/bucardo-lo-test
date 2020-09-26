@@ -1,0 +1,16 @@
+#!/bin/bash
+
+set -euo pipefail
+
+prefix=lo_test_
+
+dbgrouplist=
+for i in `seq 0 4`
+do
+	db=$prefix$i
+	./bucardo add db $db dbname=$db user=bucardo
+	dbgrouplist="$dbgrouplist $db:source"
+done
+
+./bucardo add dbgroup lo_test $dbgrouplist
+./bucardo add sync lo_test dbgroup=lo_test tables=lo_store

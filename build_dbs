@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -euo pipefail
+
+prefix=lo_test_
+maintopt=--maintenance-db=postgres
+
+for i in `seq 0 4`
+do
+	db=$prefix$i
+	echo Setting up $db
+	dropdb $maintopt --if-exists $db
+	createdb $maintopt $db
+	psql -X -d $db -f lo_store_schema.sql
+done
