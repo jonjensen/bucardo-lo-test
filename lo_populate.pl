@@ -88,7 +88,6 @@ for (my $i = 0; $i < $file_count; $i++) {
         my $send_size = ($size_left < $bufsize) ? $size_left : $bufsize;
         $size_left -= $send_size;
         my $random_loc = int(rand($max_loc));
-        my $chunk = substr($random_buffer, $random_loc, $send_size);
         print $fh substr($random_buffer, $random_loc, $send_size);
     }
 
