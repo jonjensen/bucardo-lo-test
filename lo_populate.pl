@@ -133,25 +133,30 @@ for my $filename (keys %files) {
         for (my $index = 0; $index < @dbh; $index++) {
             my $dbh = $dbh[$index];
             subtest_buffered "Database $index" => sub {
-                plan(4);
+                plan(5);
 
                 my $sth = $sth_select[$index] ||= $dbh->prepare("SELECT originating_db, loid FROM lo_store WHERE id = ?");
                 $sth->execute($filename);
                 my ($originating_db, $loid) = $sth->fetchrow_array;
-                is($originating_db, $file->{originating_db}, "originating_db matches");
+                SKIP: {
+                    ok($loid, "have an loid");
+                    $loid or skip("missing loid, so skipping remaining tests", 4);
 
-                my ($fh, $new_filename) = create_temp_file();
+                    is($originating_db, $file->{originating_db}, "originating_db matches");
 
-                my $success = $dbh->pg_lo_export($loid, $new_filename);
-                ok($success, "pg_lo_export");
+                    my ($fh, $new_filename) = create_temp_file();
 
-                seek($fh, 0, 0);
-                is(-s $new_filename, $file->{size}, "size matches");
+                    my $success = $dbh->pg_lo_export($loid, $new_filename);
+                    ok($success, "pg_lo_export");
 
-                my $sha = Digest::SHA->new($sha_type);
-                $sha->addfile($fh);
-                my $digest = $sha->digest;
-                is($digest, $file->{digest}, "digest matches");
+                    seek($fh, 0, 0);
+                    is(-s $new_filename, $file->{size}, "size matches");
+
+                    my $sha = Digest::SHA->new($sha_type);
+                    $sha->addfile($fh);
+                    my $digest = $sha->digest;
+                    is($digest, $file->{digest}, "digest matches");
+                }
             };
         }
     };
