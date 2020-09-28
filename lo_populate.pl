@@ -2,17 +2,20 @@
 
 use Modern::Perl '2015';
 use bytes;
-use UUID::FFI;
+
 use DBI;
 use Digest::SHA ();
 use File::Temp qw(mkstemp);
 use FindBin qw($RealBin);
+use UUID::FFI;
+
 use Test2::V0;
 use Test2::Tools::Basic;
 use Test2::Tools::Compare;
 use Test2::Tools::Subtest;
 use Test2::Plugin::NoWarnings;
 
+# Use a weird number of files so we (most likely) won't match any Bucardo batch sizes
 my $file_count = 777;
 
 my @dsn = map { "dbi:Pg:dbname=lo_test_$_" } (0..4);
@@ -44,6 +47,8 @@ sub create_temp_file {
     return ($fh, $filename);
 }
 
+# Build a buffer of random bytes to draw from since generating new random bytes
+# for every lo is too slow, and we don't need true randomness
 my $random_buffer_len = 8192;
 my $random_buffer = join('', map { chr(int(rand(256))) } (1..$random_buffer_len));
 my $bufsize = 512;
@@ -66,12 +71,12 @@ for (my $i = 0; $i < $file_count; $i++) {
     my ($fh, $filename) = create_temp_file();
 
     my $size = int(rand($max_normal_file_size));
-    # make a little subset of the files much larger
+    # Make a little subset of the files much larger
     my $bloat = rand();
     if    ($bloat > 0.95) { $size *= 100; }
     elsif ($bloat > 0.9)  { $size *=  10; }
 
-    # choose a random database to write this object to
+    # Choose a random database to write this object to
     my $index = int(rand() * @dbh);
 
     my $lo_pretty = sprintf($file_count_format, $i + 1);
@@ -87,7 +92,6 @@ for (my $i = 0; $i < $file_count; $i++) {
         print $fh substr($random_buffer, $random_loc, $send_size);
     }
 
-    # need to seek to flush buffers to disk before doing anything with the filename
     seek($fh, 0, 0);
     my $sha = Digest::SHA->new($sha_type);
     $sha->addfile($fh);
@@ -140,7 +144,8 @@ for my $filename (keys %files) {
     my $file = $files{$filename};
     subtest_buffered "File $filename" => sub {
         plan(scalar @dsn);
-        # verify the same large object made it to all databases
+
+        # Verify that the same large object made it to all databases
         for (my $index = 0; $index < @dbh; $index++) {
             my $dbh = $dbh[$index];
             subtest_buffered "Database $index" => sub {
@@ -160,6 +165,7 @@ for my $filename (keys %files) {
                     my $success = $dbh->pg_lo_export($loid, $new_filename);
                     ok($success, "pg_lo_export");
 
+                    # Seek to flush buffers to disk so file metadata is current
                     seek($fh, 0, 0);
                     is(-s $new_filename, $file->{size}, "size matches");
 
