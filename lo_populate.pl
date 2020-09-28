@@ -49,21 +49,35 @@ my $random_buffer = join('', map { chr(int(rand(256))) } (1..$random_buffer_len)
 my $bufsize = 512;
 my $max_loc = $random_buffer_len - $bufsize;
 
+my $max_normal_file_size = 102_400;
+my $max_file_size = $max_normal_file_size * 100;
+
+sub get_num_format { '%' . length('' . $_[0]) . 'd' }
+
+my $file_size_format = get_num_format($max_file_size);
+my $file_count_format = get_num_format($file_count);
+
 my $sha_type = 256;
+
 my %files;
 my @sth_insert;
 
 for (my $i = 0; $i < $file_count; $i++) {
     my ($fh, $filename) = create_temp_file();
 
-    # normal file size is up to 100 kiB
-    my $size = int(rand(102_400));
+    my $size = int(rand($max_normal_file_size));
     # make a little subset of the files much larger
     my $bloat = rand();
     if    ($bloat > 0.95) { $size *= 100; }
     elsif ($bloat > 0.9)  { $size *=  10; }
 
-    diag "Writing file " . ($i + 1) . " of $file_count, $size random bytes to $filename";
+    # choose a random database to write this object to
+    my $index = int(rand() * @dbh);
+
+    my $lo_pretty = sprintf($file_count_format, $i + 1);
+    my $size_pretty = sprintf($file_size_format, $size);
+    diag "lo $lo_pretty/$file_count: $size_pretty random bytes in file $filename imported to db $index";
+
     my $size_left = $size;
     while ($size_left > 0) {
         my $send_size = ($size_left < $bufsize) ? $size_left : $bufsize;
@@ -81,9 +95,6 @@ for (my $i = 0; $i < $file_count; $i++) {
 
     close $fh or die;
 
-    # choose a random database to write this object to
-    my $index = int(rand() * @dbh);
-    diag "Importing lo to database $index";
     my $dbh = $dbh[$index];
     my $loid = $dbh->pg_lo_import($filename);
 
