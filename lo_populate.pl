@@ -3,10 +3,12 @@
 use Modern::Perl '2015';
 use bytes;
 
+use Data::Dumper qw(Dumper);
 use DBI;
 use Digest::SHA ();
 use File::Temp qw(mkstemp);
 use FindBin qw($RealBin);
+use List::Util qw(shuffle);
 use UUID::FFI;
 
 use Test2::V0;
@@ -15,12 +17,12 @@ use Test2::Tools::Compare;
 use Test2::Tools::Subtest;
 use Test2::Plugin::NoWarnings;
 
-# Use a weird number of files so we (most likely) won't match any Bucardo batch sizes
-my $file_count = 777;
+# Use a weird number of rows so we (most likely) won't match any Bucardo batch sizes
+my $row_count = 1681;
 
 my @dsn = map { "dbi:Pg:dbname=lo_test_$_" } (0..4);
 
-plan($file_count);
+plan($row_count);
 
 chdir $RealBin or die;
 my $workdir = 'tmp';
@@ -54,35 +56,31 @@ my $random_buffer = join('', map { chr(int(rand(256))) } (1..$random_buffer_len)
 my $bufsize = 512;
 my $max_loc = $random_buffer_len - $bufsize;
 
-my $max_normal_file_size = 102_400;
-my $max_file_size = $max_normal_file_size * 100;
+my $max_normal_file_size = 1024;
+my $max_file_size = 300 * 1024 * 1024;
 
 sub get_num_format { '%' . length('' . $_[0]) . 'd' }
 
 my $file_size_format = get_num_format($max_file_size);
-my $file_count_format = get_num_format($file_count);
+my $row_count_format = get_num_format($row_count);
 
 my $sha_type = 256;
 
 my %files;
-my @sth_insert;
 
-for (my $i = 0; $i < $file_count; $i++) {
-    my ($fh, $filename) = create_temp_file();
+sub make_lo {
+    my $db = shift;
 
-    my $size = int(rand($max_normal_file_size));
-    # Make a little subset of the files much larger
+    # Skew distribution of file sizes
     my $bloat = rand();
-    if    ($bloat > 0.95) { $size *= 100; }
-    elsif ($bloat > 0.9)  { $size *=  10; }
+    my $size = int(do {
+        if    ($bloat < 0.87)  { 0 }
+        elsif ($bloat < 0.95)  { rand($max_normal_file_size) }
+        elsif ($bloat < 0.999) { rand($max_normal_file_size * 1000) }
+        else                   { rand($max_file_size) }
+    });
 
-    # Choose a random database to write this object to
-    my $index = int(rand() * @dbh);
-
-    my $lo_pretty = sprintf($file_count_format, $i + 1);
-    my $size_pretty = sprintf($file_size_format, $size);
-    diag "lo $lo_pretty/$file_count: $size_pretty random bytes in file $filename imported to db $index";
-
+    my ($fh, $filename) = create_temp_file();
     my $size_left = $size;
     while ($size_left > 0) {
         my $send_size = ($size_left < $bufsize) ? $size_left : $bufsize;
@@ -98,37 +96,78 @@ for (my $i = 0; $i < $file_count; $i++) {
 
     close $fh or die;
 
-    my $dbh = $dbh[$index];
-    my $loid = $dbh->pg_lo_import($filename);
+    my $dbh = $dbh[$db];
+    my $oid = $dbh->pg_lo_import($filename);
 
-    $files{$filename} = {
-        digest          => $digest,
-        oid             => $loid,
-        size            => $size,
-        originating_db  => $index,
+    my $file_info = $files{$filename} = {
+        digest => $digest,
+        oid    => $oid,
+        size   => $size,
     };
 
-    # TODO: do some UPDATEs too
-    # TODO: test table with more than 1 lo column
-    my $sth = $sth_insert[$index] ||= $dbh->prepare("INSERT INTO lo_store (id, originating_db, loid) VALUES (?,?,?)");
-    $sth->execute($filename, $index, $loid);
+    my $size_pretty = sprintf($file_size_format, $size);
+    diag "$size_pretty random bytes put in file $filename & lo created in db $db";
 
-=for skip
+    return ($filename => $file_info);
+}
 
-    # optionally commit every once in a while so Bucardo can go replicate what we have so far
-    next if $i % 150 != 0;
-    diag "Committing transactions";
-    $_->commit for @dbh;
+# Weight the tables so we spend less time on the multi-lo case
+my @tables = qw(
+    lo_store
+    lo_store
+    lo_store
+    lo_store
+    lo_store
+    lo_store_multi
+);
+
+=for later
+
+    lo_store_manual
+    lo_store_manual
+    lo_store_manual
 
 =cut
 
+my %sth_cache;
+my @rows;
+for (1..$row_count) {
+    # Randomly choose one of the tables to insert lobs to
+    my $table = $tables[int(rand() * @tables)];
+
+    # TODO: do some UPDATEs too
+    my $statement_type = 'INSERT';
+
+    my ($file_count, $columns, $placeholders) = table_to_files_columns($table, 'INSERT');
+    my $sql = "INSERT INTO $table (" . join(', ', @$columns) . ") VALUES ($placeholders)";
+
+    my $db = ($table eq 'lo_store_manual') ? 0 : int(rand() * @dbh);
+
+    my $dbh = $dbh[$db];
+    my $sth = $sth_cache{$db}{$table}{$statement_type} ||= $dbh->prepare($sql);
+    my (@filenames, @oids);
+    while (@filenames < $file_count) {
+        my ($filename, $file_info) = make_lo($db);
+        push @filenames, $filename;
+        push @oids, $file_info->{oid};
+    }
+    $sth->execute(@filenames, $db, @oids);
+
+    push @rows, {
+        db        => $db,
+        table     => $table,
+        filenames => \@filenames,
+    };
+
+    my $row_pretty = sprintf($row_count_format, scalar(@rows));
+    diag "Row $row_pretty/$row_count $statement_type to db $db table $table";
 }
 
-$_ and $_->finish for @sth_insert;
-$_ and $_->commit, $_->disconnect for @dbh;
+close_database();
 
 
-my $sleep = 45;
+# The waiting time needed will of course vary per Bucardo setup.
+my $sleep = 2 + int($row_count / 15);
 diag "Sleeping $sleep seconds for replication to complete";
 sleep $sleep;
 
@@ -137,46 +176,94 @@ sleep $sleep;
 
 connect_dbs();
 
-my @sth_select;
-
-for my $filename (keys %files) {
-    my $file = $files{$filename};
-    subtest_buffered "File $filename" => sub {
+for my $row_cache (shuffle @rows) {
+    my $filenames = $row_cache->{filenames};
+    my $table = $row_cache->{table};
+    my $test_name = "Table $table row " . join(', ', @$filenames);
+    subtest_buffered $test_name => sub {
         plan(scalar @dsn);
 
-        # Verify that the same large object made it to all databases
-        for (my $index = 0; $index < @dbh; $index++) {
-            my $dbh = $dbh[$index];
-            subtest_buffered "Database $index" => sub {
-                plan(5);
+        # Verify that the same large object(s) made it to all databases
+        for (my $db = 0; $db < @dbh; $db++) {
+            my $dbh = $dbh[$db];
+            subtest_buffered "Database $db" => sub {
+                my $file_tests = 3 * @$filenames;
+                plan(2 + $file_tests);
 
-                my $sth = $sth_select[$index] ||= $dbh->prepare("SELECT originating_db, loid FROM lo_store WHERE id = ?");
-                $sth->execute($filename);
-                my ($originating_db, $loid) = $sth->fetchrow_array;
+                my ($file_count, $columns, $placeholders, $oid_columns) = table_to_files_columns($table, 'SELECT');
+                my $sql = "SELECT * FROM $table WHERE (" . join(', ', @$columns) . ") = ($placeholders)";
+                my $sth = $sth_cache{$db}{$table}{SELECT} ||= $dbh->prepare($sql);
+                $sth->execute(@$filenames);
+                my $row = $sth->fetchrow_hashref;
                 SKIP: {
-                    ok($loid, "have an loid");
-                    $loid or skip("missing loid, so skipping remaining tests", 4);
+                    my $found = defined($row->{originating_db});
+                    ok($found, "have a row");
+                    $found or skip("missing row, so skipping remaining tests", 1 + $file_tests);
 
-                    is($originating_db, $file->{originating_db}, "originating_db matches");
+                    is($row->{originating_db}, $row_cache->{db}, "originating_db matches");
 
                     my ($fh, $new_filename) = create_temp_file();
 
-                    my $success = $dbh->pg_lo_export($loid, $new_filename);
-                    ok($success, "pg_lo_export");
+                    for (my $i = 0; $i < @$columns; $i++) {
+                        my $file_col = $columns->[$i];
+                        my $filename = $row->{$file_col};
+                        my $file = $files{$filename};
 
-                    # Seek to flush buffers to disk so file metadata is current
-                    seek($fh, 0, 0);
-                    is(-s $new_filename, $file->{size}, "size matches");
+                        my $oid_col = $oid_columns->[$i];
+                        my $oid = $row->{$oid_col};
 
-                    my $sha = Digest::SHA->new($sha_type);
-                    $sha->addfile($fh);
-                    my $digest = $sha->digest;
-                    is($digest, $file->{digest}, "digest matches");
+                        my $success = $dbh->pg_lo_export($oid, $new_filename);
+                        ok($success, "pg_lo_export");
+
+                        # Seek to flush buffers to disk so file metadata is current
+                        seek($fh, 0, 0);
+                        is(-s $new_filename, $file->{size}, "size matches");
+
+                        my $sha = Digest::SHA->new($sha_type);
+                        $sha->addfile($fh);
+                        my $digest = $sha->digest;
+                        is($digest, $file->{digest}, "digest matches");
+                    }
                 }
             };
         }
     };
 }
 
-$_ and $_->finish for @sth_select;
-$_ and $_->commit, $_->disconnect for @dbh;
+close_database();
+
+
+sub table_to_files_columns {
+    my ($table, $statement) = @_;
+    my ($file_count, @columns, @oid_columns);
+    if ($table eq 'lo_store_multi') {
+        $file_count = 3;
+        @columns  = qw( id1 id2 id3 );
+        @oid_columns = qw( loid1 loid2 loid3 );
+    }
+    else {
+        $file_count = 1;
+        @columns  = qw( id );
+        @oid_columns = qw( loid );
+    }
+    push @columns, 'originating_db', @oid_columns if $statement eq 'INSERT';
+    my $placeholders = join ',', ('?') x @columns;
+    my @return = ($file_count, \@columns, $placeholders);
+    push @return, \@oid_columns if $statement eq 'SELECT';
+    return @return;
+}
+
+sub close_database {
+    for my $db (keys %sth_cache) {
+        my $d = $sth_cache{$db};
+        for my $table (keys %$d) {
+            my $t = $sth_cache{$db}{$table};
+            for my $statement (keys %$t) {
+                local $_ = $sth_cache{$db}{$table}{$statement};
+                $_ and $_->finish;
+            }
+        }
+    }
+
+    $_ and $_->commit, $_->disconnect for @dbh;
+}

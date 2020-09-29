@@ -1,0 +1,19 @@
+#!/bin/bash
+
+#set -euo pipefail
+
+prefix=lo_test_
+
+./bucardo remove sync lo_test_delta
+./bucardo remove relgroup lo_test_delta
+
+./bucardo remove sync lo_test_manual
+./bucardo remove relgroup lo_test_manual
+
+./bucardo remove dbgroup lo_test
+
+for i in `seq 0 4`
+do
+	db=$prefix$i
+	./bucardo remove db $db --force
+done
