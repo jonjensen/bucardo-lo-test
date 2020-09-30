@@ -3,7 +3,6 @@
 use Modern::Perl '2015';
 use bytes;
 
-use Data::Dumper qw(Dumper);
 use DBI;
 use Digest::SHA ();
 use File::Temp qw(mkstemp);
@@ -32,22 +31,7 @@ chdir $workdir or die;
 my @dbh;
 my %db_attr = ( AutoCommit => 0, RaiseError => 1 );
 
-sub connect_dbs {
-    @dbh = map {
-        DBI->connect($_, undef, undef, \%db_attr) or die
-    } @dsn;
-}
-
 connect_dbs();
-
-# File::Temp name randomness is very weak and collides when rapidly called,
-# so use our own mkstemp equivalent
-sub create_temp_file {
-    my $filename = UUID::FFI->new_random->as_hex;
-    my $fh = IO::File->new($filename, "w+");
-    $fh->binmode;
-    return ($fh, $filename);
-}
 
 # Build a buffer of random bytes to draw from since generating new random bytes
 # for every lo is too slow, and we don't need true randomness
@@ -233,6 +217,15 @@ for my $row_cache (shuffle @rows) {
 close_database();
 
 
+# File::Temp name randomness is very weak and collides when rapidly called,
+# so use our own mkstemp equivalent
+sub create_temp_file {
+    my $filename = UUID::FFI->new_random->as_hex;
+    my $fh = IO::File->new($filename, "w+");
+    $fh->binmode;
+    return ($fh, $filename);
+}
+
 sub table_to_files_columns {
     my ($table, $statement) = @_;
     my ($file_count, @columns, @oid_columns);
@@ -251,6 +244,12 @@ sub table_to_files_columns {
     my @return = ($file_count, \@columns, $placeholders);
     push @return, \@oid_columns if $statement eq 'SELECT';
     return @return;
+}
+
+sub connect_dbs {
+    @dbh = map {
+        DBI->connect($_, undef, undef, \%db_attr) or die
+    } @dsn;
 }
 
 sub close_database {
