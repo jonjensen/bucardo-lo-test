@@ -151,7 +151,7 @@ close_database();
 
 
 # The waiting time needed will of course vary per Bucardo setup.
-my $sleep = 2 + int($row_count / 15);
+my $sleep = 2 + int($row_count / 50);
 diag "Sleeping $sleep seconds for replication to complete";
 sleep $sleep;
 
