@@ -46,6 +46,7 @@ my $max_file_size = 300 * 1024 * 1024;
 sub get_num_format { '%' . length('' . $_[0]) . 'd' }
 
 my $file_size_format = get_num_format($max_file_size);
+my $file_size_padding = ' ' x length('' . $max_file_size);
 my $row_count_format = get_num_format($row_count);
 
 my $sha_type = 256;
@@ -113,16 +114,21 @@ my @tables = qw(
 
 =cut
 
+my %nullable_table_column = (
+    lo_store_multi => { loid1 => undef },
+);
+
 my %sth_cache;
 my @rows;
 for (1..$row_count) {
     # Randomly choose one of the tables to insert lobs to
     my $table = $tables[int(rand() * @tables)];
+    my $nullable_check = $nullable_table_column{$table};
 
     # TODO: do some UPDATEs too
     my $statement_type = 'INSERT';
 
-    my ($file_count, $columns, $placeholders) = table_to_files_columns($table, 'INSERT');
+    my ($file_count, $columns, $placeholders, $oid_columns) = table_to_files_columns($table, 'INSERT');
     my $sql = "INSERT INTO $table (" . join(', ', @$columns) . ") VALUES ($placeholders)";
 
     my $db = ($table eq 'lo_store_manual') ? 0 : int(rand() * @dbh);
@@ -130,10 +136,24 @@ for (1..$row_count) {
     my $dbh = $dbh[$db];
     my $sth = $sth_cache{$db}{$table}{$statement_type} ||= $dbh->prepare($sql);
     my (@filenames, @oids);
-    while (@filenames < $file_count) {
-        my ($filename, $file_info) = make_lo($db);
+    for (my $i = 0; $i < $file_count; $i++) {
+        my $oid_column = $oid_columns->[$i];
+        my ($filename, $oid);
+
+        # Leave a small number of NULLable lo fields empty to exercise that
+        my $nullable = ($nullable_check and exists $nullable_check->{$oid_column});
+        if ($nullable and rand() < 0.2) {
+            $filename = get_random_name();
+            diag $file_size_padding . " Tying NULL lo to file id $filename";
+        }
+        else {
+            my $file_info;
+            ($filename, $file_info) = make_lo($db, $nullable);
+            $oid = $file_info->{oid};
+        }
+
         push @filenames, $filename;
-        push @oids, $file_info->{oid};
+        push @oids, $oid;
     }
     $sth->execute(@filenames, $db, @oids);
 
@@ -151,7 +171,7 @@ close_database();
 
 
 # The waiting time needed will of course vary per Bucardo setup.
-my $sleep = 2 + int($row_count / 50);
+my $sleep = 2 + int($row_count / 20);
 diag "Sleeping $sleep seconds for replication to complete";
 sleep $sleep;
 
@@ -171,8 +191,7 @@ for my $row_cache (shuffle @rows) {
         for (my $db = 0; $db < @dbh; $db++) {
             my $dbh = $dbh[$db];
             subtest_buffered "Database $db" => sub {
-                my $file_tests = 3 * @$filenames;
-                plan(2 + $file_tests);
+                plan(2 + @$filenames);
 
                 my ($file_count, $columns, $placeholders, $oid_columns) = table_to_files_columns($table, 'SELECT');
                 my $sql = "SELECT * FROM $table WHERE (" . join(', ', @$columns) . ") = ($placeholders)";
@@ -182,31 +201,41 @@ for my $row_cache (shuffle @rows) {
                 SKIP: {
                     my $found = defined($row->{originating_db});
                     ok($found, "have a row");
-                    $found or skip("missing row, so skipping remaining tests", 1 + $file_tests);
+                    $found or skip("missing row, so skipping remaining tests", 2);
 
                     is($row->{originating_db}, $row_cache->{db}, "originating_db matches");
 
                     my ($fh, $new_filename) = create_temp_file();
 
                     for (my $i = 0; $i < @$columns; $i++) {
-                        my $file_col = $columns->[$i];
-                        my $filename = $row->{$file_col};
-                        my $file = $files{$filename};
-
                         my $oid_col = $oid_columns->[$i];
                         my $oid = $row->{$oid_col};
 
-                        my $success = $dbh->pg_lo_export($oid, $new_filename);
-                        ok($success, "pg_lo_export");
+                        my $file_col = $columns->[$i];
+                        my $filename = $row->{$file_col};
 
-                        # Seek to flush buffers to disk so file metadata is current
-                        seek($fh, 0, 0);
-                        is(-s $new_filename, $file->{size}, "size matches");
+                        subtest_buffered "Column $oid_col, $file_col=$filename" => sub {
+                            my $file = $files{$filename};
+                            if ($file) {
+                                plan(3);
 
-                        my $sha = Digest::SHA->new($sha_type);
-                        $sha->addfile($fh);
-                        my $digest = $sha->digest;
-                        is($digest, $file->{digest}, "digest matches");
+                                my $success = $dbh->pg_lo_export($oid, $new_filename);
+                                ok($success, "pg_lo_export");
+
+                                # Seek to flush buffers to disk so file metadata is current
+                                seek($fh, 0, 0);
+                                is(-s $new_filename, $file->{size}, "size matches");
+
+                                my $sha = Digest::SHA->new($sha_type);
+                                $sha->addfile($fh);
+                                my $digest = $sha->digest;
+                                is($digest, $file->{digest}, "digest matches");
+                            }
+                            else {
+                                plan(1);
+                                ok(!defined($oid), "NULL lo oid");
+                            }
+                        };
                     }
                 }
             };
@@ -220,11 +249,13 @@ close_database();
 # File::Temp name randomness is very weak and collides when rapidly called,
 # so use our own mkstemp equivalent
 sub create_temp_file {
-    my $filename = UUID::FFI->new_random->as_hex;
+    my $filename = get_random_name();
     my $fh = IO::File->new($filename, "w+");
     $fh->binmode;
     return ($fh, $filename);
 }
+
+sub get_random_name { UUID::FFI->new_random->as_hex }
 
 sub table_to_files_columns {
     my ($table, $statement) = @_;
@@ -241,8 +272,7 @@ sub table_to_files_columns {
     }
     push @columns, 'originating_db', @oid_columns if $statement eq 'INSERT';
     my $placeholders = join ',', ('?') x @columns;
-    my @return = ($file_count, \@columns, $placeholders);
-    push @return, \@oid_columns if $statement eq 'SELECT';
+    my @return = ($file_count, \@columns, $placeholders, \@oid_columns);
     return @return;
 }
 
