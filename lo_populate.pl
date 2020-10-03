@@ -52,6 +52,7 @@ my $row_count_format = get_num_format($row_count);
 my $sha_type = 256;
 
 my %files;
+my $total_bytes = 0;
 
 sub make_lo {
     my $db = shift;
@@ -89,6 +90,7 @@ sub make_lo {
         oid    => $oid,
         size   => $size,
     };
+    $total_bytes += $size;
 
     my $size_pretty = sprintf($file_size_format, $size);
     diag "$size_pretty random bytes put in file $filename & lo created in db $db";
@@ -170,8 +172,8 @@ for (1..$row_count) {
 close_database();
 
 
-# The waiting time needed will of course vary per Bucardo setup.
-my $sleep = 2 + int($row_count / 20);
+# The waiting time needed will of course vary per server speed and Bucardo setup.
+my $sleep = 2 + int(($row_count / 150) + ($total_bytes / 6_000_000));
 diag "Sleeping $sleep seconds for replication to complete";
 sleep $sleep;
 
